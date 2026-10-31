@@ -1,0 +1,6 @@
+cmd/bx/bx
+bin/
+coverage.out
+coverage.html
+.coverage
+.gocache/

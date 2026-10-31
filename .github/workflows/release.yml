@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing semantic version tag to validate and release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate tagged source
+    runs-on: ubuntu-latest
+    services:
+      vaultwarden:
+        image: vaultwarden/server:1.37.4@sha256:2bb2e0344616c62a6d76ea10558497499f8ed3f731400e143dc7bf17b757b5b9
+        env:
+          DOMAIN: http://127.0.0.1:8080
+          SIGNUPS_ALLOWED: 'true'
+          WEB_VAULT_ENABLED: 'false'
+          ROCKET_PORT: '80'
+        ports:
+          - 8080:80
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Validate tag name
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Record immutable commit
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Validate source before building release artifacts
+        run: |
+          make vet lint vuln
+          go test -race ./...
+      - name: Verify attachment transfers against isolated Vaultwarden
+        env:
+          BX_TEST_VAULTWARDEN_URL: http://127.0.0.1:8080
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS "$BX_TEST_VAULTWARDEN_URL/alive" > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS "$BX_TEST_VAULTWARDEN_URL/alive" > /dev/null
+          go test ./internal/client -run '^TestVaultwardenAttachmentIntegration$' -count=1 -v
+
+  build:
+    name: Build (${{ matrix.suffix }})
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: linux-amd64
+          - os: macos-26
+            suffix: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Build release binary
+        env:
+          VERSION: ${{ inputs.tag }}
+        run: make build_release VERSION="$VERSION"
+      - name: Rename binary
+        run: mv cmd/bx/bx bx-${{ matrix.suffix }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bx-${{ matrix.suffix }}
+          path: bx-${{ matrix.suffix }}
+          retention-days: 1
+
+  release:
+    name: Publish validated artifacts
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          merge-multiple: true
+      - name: Generate checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          tag_commit=$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)
+          test "$tag_commit" = "$RELEASE_COMMIT"
+          sha256sum bx-* > checksums.txt
+          gh release create "$RELEASE_TAG" bx-linux-amd64 bx-darwin-arm64 checksums.txt --verify-tag --title "$RELEASE_TAG" --notes "Built from commit $RELEASE_COMMIT."

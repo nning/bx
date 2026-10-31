@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Vet, lint and vulnerability checks
+        run: make vet lint vuln
+      - name: Tests with race detector
+        run: go test -race ./...
+      - name: Build
+        run: make build
+      - name: Verify binary
+        run: cmd/bx/bx --version
+
+  integration:
+    name: Vaultwarden attachments
+    runs-on: ubuntu-latest
+    services:
+      vaultwarden:
+        image: vaultwarden/server:1.37.4@sha256:2bb2e0344616c62a6d76ea10558497499f8ed3f731400e143dc7bf17b757b5b9
+        env:
+          DOMAIN: http://127.0.0.1:8080
+          SIGNUPS_ALLOWED: 'true'
+          WEB_VAULT_ENABLED: 'false'
+          ROCKET_PORT: '80'
+        ports:
+          - 8080:80
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Verify attachment transfers against isolated Vaultwarden
+        env:
+          BX_TEST_VAULTWARDEN_URL: http://127.0.0.1:8080
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS "$BX_TEST_VAULTWARDEN_URL/alive" > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS "$BX_TEST_VAULTWARDEN_URL/alive" > /dev/null
+          go test ./internal/client -run '^TestVaultwardenAttachmentIntegration$' -count=1 -v
