@@ -26,6 +26,7 @@ jobs:
           DOMAIN: http://127.0.0.1:8080
           SIGNUPS_ALLOWED: 'true'
           WEB_VAULT_ENABLED: 'false'
+          I_REALLY_WANT_VOLATILE_STORAGE: 'true'
           ROCKET_PORT: '80'
         ports:
           - 8080:80
